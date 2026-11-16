@@ -1,0 +1,94 @@
+name: Security Gatekeeper
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+jobs:
+  snyk-aggregate: # 👈 This EXACT name matches the "snyk" required check in your Org Ruleset
+    runs-on: ubuntu-latest
+    permissions:
+      checks: read
+      pull-requests: read
+      contents: read
+      statuses: read
+      actions: read
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - name: Poll Snyk App Status
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -uo pipefail
+
+          PR_NUMBER=${{ github.event.pull_request.number }}
+          echo "Checking Snyk App status for PR #$PR_NUMBER..."
+
+          # jq filter: keep checks that mention "snyk" but exclude this aggregate gate itself
+          SNYK_FILTER='[.[] | select((.name | test("snyk"; "i")) and (.name | ascii_downcase != "snyk-aggregate"))]'
+
+          fetch_snyk_checks() {
+            local raw
+            if ! raw=$(gh pr checks "$PR_NUMBER" --json name,bucket 2>/dev/null); then
+              # gh can exit non-zero while checks are still spinning up; treat as "none yet"
+              echo "[]"
+              return 0
+            fi
+            echo "$raw" | jq "$SNYK_FILTER"
+          }
+
+          # --- Phase 1: Detection window (fail-open) ---
+          # Check immediately, then once more at 30s. If no Snyk check appears
+          # within that window, fail open and pass the gate.
+          SNYK_DETECTED=false
+
+          for attempt in 1 2; do
+            SNYK_CHECKS=$(fetch_snyk_checks)
+            TOTAL_SNYK_CHECKS=$(echo "$SNYK_CHECKS" | jq 'length')
+
+            if [ "$TOTAL_SNYK_CHECKS" -gt 0 ]; then
+              SNYK_DETECTED=true
+              echo "Detected $TOTAL_SNYK_CHECKS Snyk check(s)."
+              break
+            fi
+
+            if [ "$attempt" -lt 2 ]; then
+              echo "No Snyk checks reported yet... waiting 30s before final check."
+              sleep 30
+            fi
+          done
+
+          if [ "$SNYK_DETECTED" = false ]; then
+            echo "⚠️ No Snyk checks detected within 30s. Failing open and passing this gate."
+            exit 0
+          fi
+
+          # --- Phase 2: Wait for the detected Snyk checks to complete (fail-closed) ---
+          # Poll every 30 seconds, up to 20 times (10 minutes max)
+          for i in {1..20}; do
+            SNYK_CHECKS=$(fetch_snyk_checks)
+            TOTAL_SNYK_CHECKS=$(echo "$SNYK_CHECKS" | jq 'length')
+            PENDING=$(echo "$SNYK_CHECKS" | jq '[.[] | select(.bucket == "pending")] | length')
+            FAILED=$(echo "$SNYK_CHECKS" | jq '[.[] | select(.bucket == "fail")] | length')
+
+            echo "Found $TOTAL_SNYK_CHECKS Snyk check(s): $PENDING pending, $FAILED failed."
+
+            # If nothing is pending, we can make a decision
+            if [ "$PENDING" -eq 0 ]; then
+              if [ "$FAILED" -eq 0 ]; then
+                echo "✅ All Snyk GitHub App checks passed successfully!"
+                exit 0
+              else
+                echo "❌ Snyk App detected security vulnerabilities. Failing this gate."
+                exit 1
+              fi
+            fi
+
+            echo "⏳ Waiting 30 seconds for Snyk to finish... (Attempt $i/20)"
+            sleep 30
+          done
+
+          echo "❌ Timed out waiting for the Snyk GitHub App to finish its checks."
+          exit 1

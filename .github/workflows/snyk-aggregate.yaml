@@ -1,0 +1,149 @@
+name: Security Gatekeeper (Assets API)
+
+# Fail-closed variant of snyk-aggregate-failopen.yaml.
+#
+# Flow:
+#   1. Look the repo up via the Snyk Assets API.
+#        - not imported to Snyk        -> pass (nothing for Snyk to check)
+#        - imported, but no projects   -> pass (nothing for Snyk to check)
+#   2. Otherwise Snyk SHOULD report PR checks. Wait for them to appear
+#      (up to SNYK_CHECK_APPEAR_TIMEOUT_MINUTES, default 120). If they never
+#      appear -> fail with an explanatory error.
+#   3. Once they appear, wait as long as needed for them to finish; fail if any failed.
+#
+# Required secret:    SNYK_TOKEN
+# Required variable:  SNYK_ORG_ID
+# Optional variables: SNYK_GROUP_ID (derived from the org if unset), SNYK_API_BASE (default https://api.snyk.io; use e.g. https://api.eu.snyk.io),
+#                     SNYK_CHECK_APPEAR_TIMEOUT_MINUTES (default 120)
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+jobs:
+  snyk-aggregate: # 👈 This EXACT name matches the "snyk" required check in your Org Ruleset
+    runs-on: ubuntu-latest
+    timeout-minutes: 360 # GitHub-hosted runner maximum; the effective "wait as long as necessary"
+    permissions:
+      checks: read
+      pull-requests: read
+      contents: read
+      statuses: read
+      actions: read
+
+    steps:
+      - name: Snyk gate
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+          SNYK_ORG_ID: ${{ vars.SNYK_ORG_ID }}
+          SNYK_GROUP_ID: ${{ vars.SNYK_GROUP_ID }}
+          SNYK_API_BASE: ${{ vars.SNYK_API_BASE || 'https://api.snyk.io' }}
+          APPEAR_TIMEOUT_MIN: ${{ vars.SNYK_CHECK_APPEAR_TIMEOUT_MINUTES || '120' }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO_URL: ${{ github.server_url }}/${{ github.repository }}
+          SNYK_API_VERSION: "2024-10-15"
+        run: |
+          set -uo pipefail
+
+          fail() { echo "::error title=Snyk gate failed::$*"; exit 1; }
+
+          [ -n "${SNYK_TOKEN:-}" ] || fail "SNYK_TOKEN secret is not available (fork PR, or secret not configured). Cannot determine Snyk import status."
+          [ -n "${SNYK_ORG_ID:-}" ] || fail "SNYK_ORG_ID repository/org variable is not set."
+
+          snyk_api() {
+            # $1=method $2=path+query [$3=json body] [$4=content-type]; prints body, non-zero on HTTP error
+            local method=$1 path=$2 body=${3:-} ctype=${4:-application/json} out code
+            local args=(-sS -X "$method" -H "Authorization: token $SNYK_TOKEN" -H "Accept: application/vnd.api+json" -w $'\n%{http_code}')
+            [ -n "$body" ] && args+=(-H "Content-Type: $ctype" -d "$body")
+            out=$(curl "${args[@]}" "${SNYK_API_BASE}${path}") || return 2
+            code=${out##*$'\n'}
+            out=${out%$'\n'*}
+            if [[ "$code" != 2* ]]; then
+              echo "Snyk API $method $path returned HTTP $code: $out" >&2
+              return 1
+            fi
+            echo "$out"
+          }
+
+          # ---------- Step 1: does Snyk see the repo at all? ----------
+          # Asset search is GROUP-scoped. Resolve the group from the org unless SNYK_GROUP_ID is set.
+          if [ -z "${SNYK_GROUP_ID:-}" ]; then
+            SNYK_GROUP_ID=$(snyk_api GET "/rest/orgs/${SNYK_ORG_ID}?version=${SNYK_API_VERSION}" | jq -r '.data.attributes.group_id // empty') \
+              || fail "Could not read Snyk org $SNYK_ORG_ID (check SNYK_TOKEN and SNYK_API_BASE region)."
+            [ -n "$SNYK_GROUP_ID" ] || fail "Snyk org $SNYK_ORG_ID has no group; set the SNYK_GROUP_ID variable."
+          fi
+
+          echo "Searching Snyk assets (group $SNYK_GROUP_ID) for repository $REPO_URL ..."
+          SEARCH_BODY=$(jq -nc --arg a "$REPO_URL" --arg b "$REPO_URL.git" '{query:{attributes:{operator:"and",values:[
+            {attribute:"type",operator:"equal",values:["repository"]},
+            {operator:"or",values:[
+              {attribute:"repository_url",operator:"equal",values:[$a]},
+              {attribute:"repository_url",operator:"equal",values:[$b]}]}]}}}')
+
+          SEARCH_RESP=$(snyk_api POST "/rest/groups/${SNYK_GROUP_ID}/assets/search?version=${SNYK_API_VERSION}&limit=10" "$SEARCH_BODY") \
+            || fail "Snyk asset search failed (check SNYK_TOKEN group.read permission, SNYK_ORG_ID and SNYK_API_BASE region)."
+          ASSET_ID=$(echo "$SEARCH_RESP" | jq -r '.data[0].id // empty')
+
+          if [ -z "$ASSET_ID" ]; then
+            echo "✅ Snyk does not know about repository $REPO_URL (not imported). Nothing to wait for; passing."
+            echo "### Snyk gate: repository not imported to Snyk — passed" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          echo "Snyk knows this repository (asset $ASSET_ID)."
+
+          # ---------- Step 2: does it actually have projects? ----------
+          # An asset can exist without being imported/monitored, so projects are the real signal.
+          PROJ_RESP=$(snyk_api GET "/rest/groups/${SNYK_GROUP_ID}/assets/${ASSET_ID}/relationships/projects?version=${SNYK_API_VERSION}&limit=100") \
+            || fail "Failed to list projects for Snyk asset $ASSET_ID."
+          PROJECT_COUNT=$(echo "$PROJ_RESP" | jq '[.data[]?] | length')
+
+          if [ "$PROJECT_COUNT" -eq 0 ]; then
+            echo "✅ Repository is known to Snyk but has no projects. Nothing to wait for; passing."
+            echo "### Snyk gate: repository present in Snyk, no projects — passed" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          echo "Repository has $PROJECT_COUNT Snyk project(s); Snyk PR checks are expected."
+
+          # ---------- Step 3: wait for Snyk PR checks ----------
+          SNYK_FILTER='[.[] | select((.name | test("snyk"; "i")) and (.name | ascii_downcase != "snyk-aggregate"))]'
+
+          fetch_snyk_checks() {
+            local raw
+            if ! raw=$(gh pr checks "$PR_NUMBER" --json name,bucket 2>/dev/null); then
+              echo "[]"; return 0   # gh exits non-zero while checks are spinning up
+            fi
+            echo "$raw" | jq "$SNYK_FILTER"
+          }
+
+          DEADLINE=$(( $(date +%s) + APPEAR_TIMEOUT_MIN * 60 ))
+          while :; do
+            CHECKS=$(fetch_snyk_checks)
+            [ "$(echo "$CHECKS" | jq 'length')" -gt 0 ] && break
+            if [ "$(date +%s)" -ge "$DEADLINE" ]; then
+              fail "Repository $REPO_URL is imported to Snyk with $PROJECT_COUNT project(s), but no Snyk PR check appeared on PR #$PR_NUMBER within ${APPEAR_TIMEOUT_MIN} minutes. Snyk may be down, the PR checks integration may be disabled for this repo/branch, or the PR targets a branch Snyk does not monitor. Re-run this job once resolved, or raise SNYK_CHECK_APPEAR_TIMEOUT_MINUTES."
+            fi
+            echo "⏳ Waiting for Snyk PR checks to appear..."
+            sleep 30
+          done
+          echo "Detected $(echo "$CHECKS" | jq 'length') Snyk check(s)."
+
+          # Wait as long as necessary (bounded only by the job timeout) for completion.
+          while :; do
+            CHECKS=$(fetch_snyk_checks)
+            TOTAL=$(echo "$CHECKS" | jq 'length')
+            PENDING=$(echo "$CHECKS" | jq '[.[] | select(.bucket == "pending")] | length')
+            FAILED=$(echo "$CHECKS" | jq '[.[] | select(.bucket == "fail")] | length')
+            echo "Snyk checks: $TOTAL total, $PENDING pending, $FAILED failed."
+
+            if [ "$PENDING" -eq 0 ]; then
+              if [ "$FAILED" -eq 0 ]; then
+                echo "✅ All Snyk PR checks passed."
+                echo "### Snyk gate: all Snyk PR checks passed" >> "$GITHUB_STEP_SUMMARY"
+                exit 0
+              fi
+              fail "$FAILED Snyk PR check(s) failed on PR #$PR_NUMBER."
+            fi
+            sleep 30
+          done
