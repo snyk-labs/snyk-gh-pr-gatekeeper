@@ -4,15 +4,16 @@ name: Security Gatekeeper (Assets API)
 #
 # Flow:
 #   1. Look the repo up via the Snyk Assets API.
-#        - not imported to Snyk        -> pass (nothing for Snyk to check)
-#        - imported, but no projects   -> pass (nothing for Snyk to check)
+#        - no asset in Snyk             -> FAIL "Repo not imported in Snyk"
+#        - asset but no target in org   -> FAIL "Repo not imported in Snyk"
+#        - target exists, no projects   -> pass (nothing for Snyk to check)
 #   2. Otherwise Snyk SHOULD report PR checks. Wait for them to appear
 #      (up to SNYK_CHECK_APPEAR_TIMEOUT_MINUTES, default 120). If they never
 #      appear -> fail with an explanatory error.
 #   3. Once they appear, wait as long as needed for them to finish; fail if any failed.
 #
 # Required secret:    SNYK_TOKEN
-# Required variable:  SNYK_ORG_ID
+# Required variable:  SNYK_ORG_ID (the org the repo is imported into; targets are looked up here)
 # Optional variables: SNYK_GROUP_ID (derived from the org if unset), SNYK_API_BASE (default https://api.snyk.io; use e.g. https://api.eu.snyk.io),
 #                     SNYK_CHECK_APPEAR_TIMEOUT_MINUTES (default 120)
 
@@ -87,21 +88,44 @@ jobs:
           ASSET_ID=$(echo "$SEARCH_RESP" | jq -r '.data[0].id // empty')
 
           if [ -z "$ASSET_ID" ]; then
-            echo "✅ Snyk does not know about repository $REPO_URL (not imported). Nothing to wait for; passing."
-            echo "### Snyk gate: repository not imported to Snyk — passed" >> "$GITHUB_STEP_SUMMARY"
-            exit 0
+            INV_RESP=$(snyk_api GET "/rest/groups/${SNYK_GROUP_ID}/inventory/assets?version=${SNYK_API_VERSION}&limit=10&filter=$(jq -rn --arg f "url==$REPO_URL" '$f|@uri')") \
+              || fail "Snyk inventory lookup failed."
+            ASSET_ID=$(echo "$INV_RESP" | jq -r '.data[0].id // empty')
+          fi
+
+          if [ -z "$ASSET_ID" ]; then
+            echo "::error title=Repo not imported in Snyk::Repo not imported in Snyk ($REPO_URL)"
+            echo "### Snyk gate: Repo not imported in Snyk — failed" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
           fi
           echo "Snyk knows this repository (asset $ASSET_ID)."
 
-          # ---------- Step 2: does it actually have projects? ----------
-          # An asset can exist without being imported/monitored, so projects are the real signal.
-          PROJ_RESP=$(snyk_api GET "/rest/groups/${SNYK_GROUP_ID}/assets/${ASSET_ID}/relationships/projects?version=${SNYK_API_VERSION}&limit=100") \
-            || fail "Failed to list projects for Snyk asset $ASSET_ID."
-          PROJECT_COUNT=$(echo "$PROJ_RESP" | jq '[.data[]?] | length')
+          # ---------- Step 2: is there an import target, and does it have projects? ----------
+          # Targets live in an org. exclude_empty=false is required, otherwise targets without projects are hidden.
+          TARGET_IDS=""
+          for U in "$REPO_URL" "$REPO_URL.git"; do
+            TARGETS_RESP=$(snyk_api GET "/rest/orgs/${SNYK_ORG_ID}/targets?version=${SNYK_API_VERSION}&limit=100&exclude_empty=false&url=$(jq -rn --arg u "$U" '$u|@uri')") \
+              || fail "Failed to list Snyk targets in org $SNYK_ORG_ID."
+            TARGET_IDS=$(printf '%s\n%s' "$TARGET_IDS" "$(echo "$TARGETS_RESP" | jq -r '.data[]?.id')")
+          done
+          TARGET_IDS=$(echo "$TARGET_IDS" | sed '/^$/d' | sort -u)
+
+          if [ -z "$TARGET_IDS" ]; then
+            echo "::error title=Repo not imported in Snyk::Repo not imported in Snyk. Snyk has discovered $REPO_URL, but there is no import target for it in org $SNYK_ORG_ID."
+            echo "### Snyk gate: Repo not imported in Snyk (no target in org $SNYK_ORG_ID) — failed" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+          PROJECT_COUNT=0
+          for T in $TARGET_IDS; do
+            PROJ_RESP=$(snyk_api GET "/rest/orgs/${SNYK_ORG_ID}/projects?version=${SNYK_API_VERSION}&limit=100&target_id=${T}") \
+              || fail "Failed to list projects for Snyk target $T."
+            PROJECT_COUNT=$(( PROJECT_COUNT + $(echo "$PROJ_RESP" | jq '[.data[]?] | length') ))
+          done
 
           if [ "$PROJECT_COUNT" -eq 0 ]; then
-            echo "✅ Repository is known to Snyk but has no projects. Nothing to wait for; passing."
-            echo "### Snyk gate: repository present in Snyk, no projects — passed" >> "$GITHUB_STEP_SUMMARY"
+            echo "✅ Repository is imported to Snyk but its target has no projects. Nothing to wait for; passing."
+            echo "### Snyk gate: repository imported, target has no projects — passed" >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
           echo "Repository has $PROJECT_COUNT Snyk project(s); Snyk PR checks are expected."
