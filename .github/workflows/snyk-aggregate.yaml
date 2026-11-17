@@ -3,7 +3,8 @@ name: Security Gatekeeper (Assets API)
 # Fail-closed variant of snyk-aggregate-failopen.yaml.
 #
 # Flow:
-#   1. Look the repo up via the Snyk Assets API.
+#   0. If Snyk PR checks are already on the PR, skip the Snyk APIs and go to step 3.
+#   1. Otherwise look the repo up via the Snyk Assets and Inventory APIs.
 #        - no asset in Snyk             -> FAIL "Repo not imported in Snyk"
 #        - asset but no import target   -> FAIL "Repo not imported in Snyk"
 #        - target exists, no projects   -> pass (nothing for Snyk to check)
@@ -49,9 +50,6 @@ jobs:
 
           fail() { echo "::error title=Snyk gate failed::$*"; exit 1; }
 
-          [ -n "${SNYK_TOKEN:-}" ] || fail "SNYK_TOKEN secret is not available (fork PR, or secret not configured). Cannot determine Snyk import status."
-          [ -n "${SNYK_GROUP_ID:-}" ] || fail "SNYK_GROUP_ID repository/org variable is not set."
-
           snyk_api() {
             # $1=method $2=path+query [$3=json body] [$4=content-type]; prints body, non-zero on HTTP error
             local method=$1 path=$2 body=${3:-} ctype=${4:-application/json} out code
@@ -67,64 +65,6 @@ jobs:
             echo "$out"
           }
 
-          # ---------- Step 1: does Snyk see the repo at all? ----------
-          # Everything below is group-scoped; no org is needed.
-          echo "Looking up $REPO_URL in Snyk group $SNYK_GROUP_ID ..."
-          uriencode() { jq -rn --arg v "$1" '$v|@uri'; }
-
-          # (a) Assets search
-          SEARCH_BODY=$(jq -nc --arg a "$REPO_URL" --arg b "$REPO_URL.git" '{query:{attributes:{operator:"and",values:[
-            {attribute:"type",operator:"equal",values:["repository"]},
-            {operator:"or",values:[
-              {attribute:"repository_url",operator:"equal",values:[$a]},
-              {attribute:"repository_url",operator:"equal",values:[$b]}]}]}}}')
-          SEARCH_RESP=$(snyk_api POST "/rest/groups/${SNYK_GROUP_ID}/assets/search?version=${SNYK_API_VERSION}&limit=10" "$SEARCH_BODY") \
-            || fail "Snyk asset search failed (check SNYK_TOKEN group.read permission, SNYK_GROUP_ID and SNYK_API_BASE region)."
-          SEARCH_ASSET_ID=$(echo "$SEARCH_RESP" | jq -r '.data[0].id // empty')
-
-          # (b) Inventory assets
-          INV_RESP=$(snyk_api GET "/rest/groups/${SNYK_GROUP_ID}/inventory/assets?version=${SNYK_API_VERSION}&limit=10&filter=$(uriencode "url==$REPO_URL")") \
-            || fail "Snyk inventory lookup failed."
-          INV_ASSET_IDS=$(echo "$INV_RESP" | jq -r '.data[]?.id')
-
-          if [ -z "$SEARCH_ASSET_ID" ] && [ -z "$INV_ASSET_IDS" ]; then
-            echo "::error title=Repo not imported in Snyk::Repo not imported in Snyk ($REPO_URL)"
-            echo "### Snyk gate: Repo not imported in Snyk — failed" >> "$GITHUB_STEP_SUMMARY"
-            exit 1
-          fi
-          echo "Snyk knows this repository (search asset: ${SEARCH_ASSET_ID:-none}; inventory assets: $(echo $INV_ASSET_IDS | wc -w | tr -d " "))."
-
-          # ---------- Step 2: import target and projects, from the asset relationships ----------
-          TARGET_COUNT=0
-          PROJECT_COUNT=0
-          for ID in $INV_ASSET_IDS; do
-            R=$(snyk_api GET "/rest/groups/${SNYK_GROUP_ID}/inventory/assets/${ID}/relationships/targets?version=${SNYK_API_VERSION}&limit=100") \
-              || fail "Failed to list targets for Snyk inventory asset $ID."
-            TARGET_COUNT=$(( TARGET_COUNT + $(echo "$R" | jq '[.data[]?] | length') ))
-            R=$(snyk_api GET "/rest/groups/${SNYK_GROUP_ID}/inventory/assets/${ID}/relationships/projects?version=${SNYK_API_VERSION}&limit=100") \
-              || fail "Failed to list projects for Snyk inventory asset $ID."
-            PROJECT_COUNT=$(( PROJECT_COUNT + $(echo "$R" | jq '[.data[]?] | length') ))
-          done
-          if [ -n "$SEARCH_ASSET_ID" ]; then
-            R=$(snyk_api GET "/rest/groups/${SNYK_GROUP_ID}/assets/${SEARCH_ASSET_ID}/relationships/projects?version=${SNYK_API_VERSION}&limit=100") \
-              || fail "Failed to list projects for Snyk asset $SEARCH_ASSET_ID."
-            PROJECT_COUNT=$(( PROJECT_COUNT + $(echo "$R" | jq '[.data[]?] | length') ))
-          fi
-          echo "Targets: $TARGET_COUNT, projects: $PROJECT_COUNT."
-
-          if [ "$PROJECT_COUNT" -eq 0 ]; then
-            if [ "$TARGET_COUNT" -eq 0 ]; then
-              echo "::error title=Repo not imported in Snyk::Repo not imported in Snyk. Snyk has discovered $REPO_URL, but it has no import target."
-              echo "### Snyk gate: Repo not imported in Snyk (no import target) — failed" >> "$GITHUB_STEP_SUMMARY"
-              exit 1
-            fi
-            echo "✅ Repository is imported to Snyk but its target has no projects. Nothing to wait for; passing."
-            echo "### Snyk gate: repository imported, target has no projects — passed" >> "$GITHUB_STEP_SUMMARY"
-            exit 0
-          fi
-          echo "Repository has $PROJECT_COUNT Snyk project(s); Snyk PR checks are expected."
-
-          # ---------- Step 3: wait for Snyk PR checks ----------
           SNYK_FILTER='[.[] | select((.name | test("snyk"; "i")) and (.name | ascii_downcase != "snyk-aggregate"))]'
 
           fetch_snyk_checks() {
@@ -134,6 +74,82 @@ jobs:
             fi
             echo "$raw" | jq "$SNYK_FILTER"
           }
+
+          # ---------- Step 0: are Snyk PR checks already on the PR? ----------
+          # Check this first; the Snyk APIs are only consulted when no Snyk check exists yet.
+          # The lookup decides whether checks are expected at all (not imported -> fail,
+          # imported but no projects -> pass) or whether to wait for them to appear.
+          PROJECT_COUNT=0
+          snyk_lookup() {
+            [ -n "${SNYK_TOKEN:-}" ] || fail "SNYK_TOKEN secret is not available (fork PR, or secret not configured). Cannot determine Snyk import status."
+            [ -n "${SNYK_GROUP_ID:-}" ] || fail "SNYK_GROUP_ID repository/org variable is not set."
+
+            # ---------- Step 1: does Snyk see the repo at all? ----------
+            # Everything below is group-scoped; no org is needed.
+            echo "Looking up $REPO_URL in Snyk group $SNYK_GROUP_ID ..."
+            uriencode() { jq -rn --arg v "$1" '$v|@uri'; }
+
+            # (a) Assets search
+            SEARCH_BODY=$(jq -nc --arg a "$REPO_URL" --arg b "$REPO_URL.git" '{query:{attributes:{operator:"and",values:[
+              {attribute:"type",operator:"equal",values:["repository"]},
+              {operator:"or",values:[
+                {attribute:"repository_url",operator:"equal",values:[$a]},
+                {attribute:"repository_url",operator:"equal",values:[$b]}]}]}}}')
+            SEARCH_RESP=$(snyk_api POST "/rest/groups/${SNYK_GROUP_ID}/assets/search?version=${SNYK_API_VERSION}&limit=10" "$SEARCH_BODY") \
+              || fail "Snyk asset search failed (check SNYK_TOKEN group.read permission, SNYK_GROUP_ID and SNYK_API_BASE region)."
+            SEARCH_ASSET_ID=$(echo "$SEARCH_RESP" | jq -r '.data[0].id // empty')
+
+            # (b) Inventory assets
+            INV_RESP=$(snyk_api GET "/rest/groups/${SNYK_GROUP_ID}/inventory/assets?version=${SNYK_API_VERSION}&limit=10&filter=$(uriencode "url==$REPO_URL")") \
+              || fail "Snyk inventory lookup failed."
+            INV_ASSET_IDS=$(echo "$INV_RESP" | jq -r '.data[]?.id')
+
+            if [ -z "$SEARCH_ASSET_ID" ] && [ -z "$INV_ASSET_IDS" ]; then
+              echo "::error title=Repo not imported in Snyk::Repo not imported in Snyk ($REPO_URL)"
+              echo "### Snyk gate: Repo not imported in Snyk — failed" >> "$GITHUB_STEP_SUMMARY"
+              exit 1
+            fi
+            echo "Snyk knows this repository (search asset: ${SEARCH_ASSET_ID:-none}; inventory assets: $(echo $INV_ASSET_IDS | wc -w | tr -d " "))."
+
+            # ---------- Step 2: import target and projects, from the asset relationships ----------
+            TARGET_COUNT=0
+            PROJECT_COUNT=0
+            for ID in $INV_ASSET_IDS; do
+              R=$(snyk_api GET "/rest/groups/${SNYK_GROUP_ID}/inventory/assets/${ID}/relationships/targets?version=${SNYK_API_VERSION}&limit=100") \
+                || fail "Failed to list targets for Snyk inventory asset $ID."
+              TARGET_COUNT=$(( TARGET_COUNT + $(echo "$R" | jq '[.data[]?] | length') ))
+              R=$(snyk_api GET "/rest/groups/${SNYK_GROUP_ID}/inventory/assets/${ID}/relationships/projects?version=${SNYK_API_VERSION}&limit=100") \
+                || fail "Failed to list projects for Snyk inventory asset $ID."
+              PROJECT_COUNT=$(( PROJECT_COUNT + $(echo "$R" | jq '[.data[]?] | length') ))
+            done
+            if [ -n "$SEARCH_ASSET_ID" ]; then
+              R=$(snyk_api GET "/rest/groups/${SNYK_GROUP_ID}/assets/${SEARCH_ASSET_ID}/relationships/projects?version=${SNYK_API_VERSION}&limit=100") \
+                || fail "Failed to list projects for Snyk asset $SEARCH_ASSET_ID."
+              PROJECT_COUNT=$(( PROJECT_COUNT + $(echo "$R" | jq '[.data[]?] | length') ))
+            fi
+            echo "Targets: $TARGET_COUNT, projects: $PROJECT_COUNT."
+
+            if [ "$PROJECT_COUNT" -eq 0 ]; then
+              if [ "$TARGET_COUNT" -eq 0 ]; then
+                echo "::error title=Repo not imported in Snyk::Repo not imported in Snyk. Snyk has discovered $REPO_URL, but it has no import target."
+                echo "### Snyk gate: Repo not imported in Snyk (no import target) — failed" >> "$GITHUB_STEP_SUMMARY"
+                exit 1
+              fi
+              echo "✅ Repository is imported to Snyk but its target has no projects. Nothing to wait for; passing."
+              echo "### Snyk gate: repository imported, target has no projects — passed" >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            echo "Repository has $PROJECT_COUNT Snyk project(s); Snyk PR checks are expected."
+
+          }
+
+          CHECKS=$(fetch_snyk_checks)
+          if [ "$(echo "$CHECKS" | jq 'length')" -gt 0 ]; then
+            echo "Snyk PR check(s) already present on PR #$PR_NUMBER; skipping the Snyk lookup."
+          else
+            echo "No Snyk PR checks yet on PR #$PR_NUMBER; looking the repository up in Snyk."
+            snyk_lookup
+          fi
 
           DEADLINE=$(( $(date +%s) + APPEAR_TIMEOUT_MIN * 60 ))
           while :; do
