@@ -22,6 +22,8 @@ It comes in two variants:
 
 ## Quick start
 
+For a step-by-step walkthrough with screenshots, see the **[setup guide](docs/SETUP.md)**.
+
 **Requirements**
 
 - Snyk PR checks enabled for the repositories you want to gate, through the Snyk GitHub integration.
@@ -241,3 +243,4 @@ Every run writes a one-line summary to the job summary page.
 | [`.github/workflows/snyk-aggregate-failopen.yaml`](.github/workflows/snyk-aggregate-failopen.yaml) | The fail-open gate: no Snyk credentials needed |
 | [`.github/workflows/snyk-aggregate.yaml`](.github/workflows/snyk-aggregate.yaml) | The fail-closed gate |
 | [`set-enterprise-snyk-secrets.sh`](set-enterprise-snyk-secrets.sh) | Sets the Snyk secret and variable on every org in an enterprise (fail-closed) |
+| [`docs/SETUP.md`](docs/SETUP.md) | Step-by-step setup guide with screenshots |
